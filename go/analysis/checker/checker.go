@@ -41,6 +41,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/tools/go/analysis"
@@ -122,8 +123,11 @@ type Action struct {
 	Diagnostics []analysis.Diagnostic
 	Duration    time.Duration // execution time of this step
 
-	opts         *Options
-	once         sync.Once
+	opts *Options
+	once sync.Once
+	// dependents counts actions with this one in their Deps that have not
+	// yet finished; the last to finish releases this action's Result.
+	dependents   atomic.Int32
 	pass         *analysis.Pass
 	objectFacts  map[objectFactKey]analysis.Fact
 	packageFacts map[packageFactKey]analysis.Fact
@@ -205,13 +209,21 @@ func Analyze(analyzers []*analysis.Analyzer, pkgs []*packages.Package, opts *Opt
 		}
 	}
 
+	// Count each action's dependents, so that execOnce can release an
+	// intermediate Result, such as SSA, as soon as nothing needs it.
+	for _, act := range actions {
+		for _, dep := range act.Deps {
+			dep.dependents.Add(1)
+		}
+	}
+
 	// Execute the graph in parallel.
 	execAll(roots)
 
 	// Ensure that only root Results are visible to caller.
 	// (The others are considered temporary intermediaries.)
-	// TODO(adonovan): opt: clear them earlier, so we can
-	// release large data structures like SSA sooner.
+	// execOnce has already released each once its last dependent
+	// finished; this keeps that guarantee independent of it.
 	for _, act := range actions {
 		if !act.IsRoot {
 			act.Result = nil
@@ -260,6 +272,21 @@ func (act *Action) exec() { act.once.Do(act.execOnce) }
 func (act *Action) execOnce() {
 	// Analyze dependencies.
 	execAll(act.Deps)
+
+	// Once this action is done, release what it holds of its
+	// dependencies' results: its pass's inputs, which drivers keep the
+	// pass for, and each intermediate result it was the last to need.
+	// Root results stay, as the caller reads them.
+	defer func() {
+		if act.pass != nil {
+			act.pass.ResultOf = nil
+		}
+		for _, dep := range act.Deps {
+			if dep.dependents.Add(-1) == 0 && !dep.IsRoot {
+				dep.Result = nil
+			}
+		}
+	}()
 
 	// Record time spent in this node but not its dependencies.
 	// In parallel mode, due to GC/scheduler contention, the
